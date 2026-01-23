@@ -1,0 +1,63 @@
+[package]
+name = "d_code"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[dependencies]
+# PyO3 for embedding Python
+pyo3 = { version = "0.23", features = ["auto-initialize"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Desktop windowing and WebView
+tao = "0.33"
+wry = { version = "0.49", features = ["devtools"] }
+
+# Include static files
+rust-embed = "8"
+mime_guess = "2"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+fern = "0.7"
+chrono = "0.4"
+
+# Environment variables from .env file
+dotenvy = "0.15"
+
+# Security: encryption for embedded code
+aes-gcm = "0.10"
+rand = "0.8"
+base64 = "0.22"
+
+# Platform directories (Documents, AppData, etc.)
+dirs = "5"
+
+# Regex for parsing AI responses
+regex = "1"
+
+# Lazy static for global state
+lazy_static = "1.4"
+
+# UUID for unique identifiers
+uuid = { version = "1", features = ["v4"] }
+
+[build-dependencies]
+
+[features]
+default = []
+aes-encryption = []
+
+[profile.release]
+# Strip symbols for security
+strip = true
+lto = true
+codegen-units = 1
+opt-level = "z"
