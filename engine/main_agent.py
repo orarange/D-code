@@ -241,11 +241,19 @@ class DCodeEngine:
         # different thread than the one running the asyncio loop that processes a
         # message, so the break signal must be thread-safe.
         self._break_event = threading.Event()
+        # Serialize message processing: only one AI request may be in flight per
+        # engine. Without this, a second concurrent send_human_message (the
+        # pywebview path spawns a thread per message) could clear the break flag
+        # out from under an in-flight request and make Stop-AI ineffective.
+        self._message_lock = threading.Lock()
         # Force-stop the AI if it does not respond within this many seconds.
         try:
-            self._response_timeout = float(os.getenv("DCODE_RESPONSE_TIMEOUT", "120"))
+            timeout = float(os.getenv("DCODE_RESPONSE_TIMEOUT", "120"))
         except (TypeError, ValueError):
-            self._response_timeout = 120.0
+            timeout = 120.0
+        # A non-positive timeout would force-stop every request immediately;
+        # fall back to the default rather than break the UI.
+        self._response_timeout = timeout if timeout > 0 else 120.0
         self._langgraph_available = LANGGRAPH_AVAILABLE
         
     def add_stream_callback(self, callback: Callable[[str, str], None]) -> None:
@@ -456,62 +464,74 @@ class DCodeEngine:
         is raced against a break request and an overall response timeout, so the
         Stop-AI button takes effect immediately and a hung AI is force-stopped.
         """
-        # Start each request from a clean break state so a stale Stop from a
-        # previous turn does not immediately cancel this one.
-        self._break_event.clear()
-        self._state.break_requested = False
-
-        self._state.human_message = message
-        self._state.messages.append({"role": "user", "content": message})
-
-        # Let the orchestrator interpret the interrupt, but do not let it block
-        # the loop: race it against a user break and a timeout.
-        interpret_task = asyncio.ensure_future(
-            self.orchestrator.interpret_interrupt(self._state, message)
-        )
-        break_task = asyncio.ensure_future(self._wait_for_break())
-
+        # Serialize processing so a second (concurrent) message cannot clear the
+        # break flag while this request is still running. Acquire off-loop so the
+        # event loop stays responsive while queued behind an in-flight request.
+        await asyncio.to_thread(self._message_lock.acquire)
         try:
-            done, _pending = await asyncio.wait(
-                {interpret_task, break_task},
-                timeout=self._response_timeout,
-                return_when=asyncio.FIRST_COMPLETED,
+            # Start each request from a clean break state so a stale Stop from a
+            # previous turn does not immediately cancel this one.
+            self._break_event.clear()
+            self._state.break_requested = False
+
+            self._state.human_message = message
+            self._state.messages.append({"role": "user", "content": message})
+
+            # Let the orchestrator interpret the interrupt, but do not let it
+            # block the loop: race it against a user break and a timeout.
+            interpret_task = asyncio.ensure_future(
+                self.orchestrator.interpret_interrupt(self._state, message)
             )
-        finally:
-            break_task.cancel()
+            break_task = asyncio.ensure_future(self._wait_for_break())
 
-        if interpret_task not in done:
-            # Either the user stopped it, or it timed out. In both cases stop
-            # waiting on the model. (The worker thread may still finish in the
-            # background, but its result is discarded.)
-            interpret_task.cancel()
-            if self._break_event.is_set():
-                self._broadcast("system", "🛑 AI processing stopped by user.")
-            else:
-                self._broadcast(
-                    "system",
-                    f"⏱️ AI did not respond within {self._response_timeout:.0f}s - "
-                    "forcibly stopped.",
+            try:
+                done, _pending = await asyncio.wait(
+                    {interpret_task, break_task},
+                    timeout=self._response_timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
-            return
+            finally:
+                # Cancel whatever is still pending and await every task so its
+                # cancellation completes cleanly (avoids "Task was destroyed but
+                # it is pending" / unhandled-exception warnings).
+                for t in (interpret_task, break_task):
+                    if not t.done():
+                        t.cancel()
+                await asyncio.gather(interpret_task, break_task, return_exceptions=True)
 
-        try:
-            action = interpret_task.result()
-        except asyncio.CancelledError:
-            return
-        except Exception as e:  # pragma: no cover - defensive
-            self._broadcast("system", f"❌ Error interpreting message: {e}")
-            return
+            if interpret_task not in done:
+                # Either the user stopped it, or it timed out. In both cases we
+                # stop waiting on the model. (The worker thread may still finish
+                # in the background, but its result is discarded.)
+                if self._break_event.is_set():
+                    self._broadcast("system", "🛑 AI processing stopped by user.")
+                else:
+                    self._broadcast(
+                        "system",
+                        f"⏱️ AI did not respond within {self._response_timeout:.0f}s - "
+                        "forcibly stopped.",
+                    )
+                return
 
-        if action["action"] == "inject":
-            self._state.tasks.insert(0, {
-                "id": f"human_{len(self._state.messages)}",
-                "description": message,
-                "status": "pending",
-                "priority": action.get("priority", 5)
-            })
-        elif action["action"] == "abort":
-            self.request_break()
+            try:
+                action = interpret_task.result()
+            except asyncio.CancelledError:
+                return
+            except Exception as e:  # pragma: no cover - defensive
+                self._broadcast("system", f"❌ Error interpreting message: {e}")
+                return
+
+            if action["action"] == "inject":
+                self._state.tasks.insert(0, {
+                    "id": f"human_{len(self._state.messages)}",
+                    "description": message,
+                    "status": "pending",
+                    "priority": action.get("priority", 5)
+                })
+            elif action["action"] == "abort":
+                self.request_break()
+        finally:
+            self._message_lock.release()
 
 
 # Factory function for easy instantiation
