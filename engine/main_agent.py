@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Optional
@@ -133,16 +134,20 @@ class Orchestrator:
         if self._on_stream:
             self._on_stream(agent, message)
     
-    async def interpret_interrupt(self, state: SystemState, human_input: str) -> dict[str, Any]:
+    def interpret_interrupt_sync(self, state: SystemState, human_input: str) -> dict[str, Any]:
         """
-        Interpret human interrupt and decide how to handle it.
-        Returns action to take: 'inject', 'queue', 'abort', 'continue'.
+        Synchronous core of interrupt interpretation.
+
+        This performs a *blocking* network call to the model. It is kept
+        separate from the async wrapper so callers can offload it to a worker
+        thread (via ``asyncio.to_thread``) and keep the event loop responsive
+        to Stop-AI / break requests while the model is thinking.
         """
         if not self._client:
             return {"action": "continue", "reason": "No API client configured"}
-        
+
         prompt = f"""You are an AI orchestrator managing a software development team.
-        
+
 Current state: {state.current_state.value}
 Current task: {state.current_task_id}
 Pending tasks: {len(state.tasks)}
@@ -170,6 +175,16 @@ Respond with JSON: {{"action": "<action>", "reason": "<brief explanation>", "pri
         except Exception as e:
             self._emit("orchestrator", f"Error interpreting interrupt: {e}")
             return {"action": "continue", "reason": str(e)}
+
+    async def interpret_interrupt(self, state: SystemState, human_input: str) -> dict[str, Any]:
+        """
+        Interpret human interrupt and decide how to handle it.
+        Returns action to take: 'inject', 'queue', 'abort', 'continue'.
+
+        The blocking model call is offloaded to a worker thread so the event
+        loop stays responsive (e.g. to Stop-AI requests) while it runs.
+        """
+        return await asyncio.to_thread(self.interpret_interrupt_sync, state, human_input)
     
     async def handle_error_escalation(self, state: SystemState, error: dict[str, Any]) -> dict[str, Any]:
         """
@@ -222,7 +237,23 @@ class DCodeEngine:
         self._compiled_graph: Any = None
         self._state = SystemState()
         self._stream_callbacks: list[Callable[[str, str], None]] = []
-        self._break_event = asyncio.Event()
+        # threading.Event (not asyncio.Event): request_break() is invoked from a
+        # different thread than the one running the asyncio loop that processes a
+        # message, so the break signal must be thread-safe.
+        self._break_event = threading.Event()
+        # Serialize message processing: only one AI request may be in flight per
+        # engine. Without this, a second concurrent send_human_message (the
+        # pywebview path spawns a thread per message) could clear the break flag
+        # out from under an in-flight request and make Stop-AI ineffective.
+        self._message_lock = threading.Lock()
+        # Force-stop the AI if it does not respond within this many seconds.
+        try:
+            timeout = float(os.getenv("DCODE_RESPONSE_TIMEOUT", "120"))
+        except (TypeError, ValueError):
+            timeout = 120.0
+        # A non-positive timeout would force-stop every request immediately;
+        # fall back to the default rather than break the UI.
+        self._response_timeout = timeout if timeout > 0 else 120.0
         self._langgraph_available = LANGGRAPH_AVAILABLE
         
     def add_stream_callback(self, callback: Callable[[str, str], None]) -> None:
@@ -397,28 +428,110 @@ class DCodeEngine:
         return self._state
     
     def request_break(self) -> None:
-        """Request a break/pause in processing."""
+        """Request a break/pause in processing.
+
+        Safe to call from any thread. Sets a thread-safe event that the
+        message-processing loop polls, so an in-flight AI call is abandoned
+        promptly instead of blocking until it returns.
+        """
         self._state.break_requested = True
         self._break_event.set()
+        self._log_break_requested()
         self._broadcast("system", "🛑 Break requested!")
+
+    def _log_break_requested(self) -> None:
+        """Write a debug log entry when the user presses Stop AI."""
+        try:
+            from .logger import log_agent_message
+            log_agent_message(
+                "system",
+                "Stop AI pressed: break requested by user",
+                message_type="command",
+            )
+        except Exception:
+            # Logging must never crash the stop path.
+            pass
+
+    async def _wait_for_break(self, poll_interval: float = 0.1) -> None:
+        """Await until a break has been requested (polls the threading event)."""
+        while not self._break_event.is_set():
+            await asyncio.sleep(poll_interval)
     
     async def send_human_message(self, message: str) -> None:
-        """Send a message from the human user."""
-        self._state.human_message = message
-        self._state.messages.append({"role": "user", "content": message})
-        
-        # Let orchestrator interpret the interrupt
-        action = await self.orchestrator.interpret_interrupt(self._state, message)
-        
-        if action["action"] == "inject":
-            self._state.tasks.insert(0, {
-                "id": f"human_{len(self._state.messages)}",
-                "description": message,
-                "status": "pending",
-                "priority": action.get("priority", 5)
-            })
-        elif action["action"] == "abort":
-            self.request_break()
+        """Send a message from the human user.
+
+        The orchestrator's (blocking) interpretation runs in a worker thread and
+        is raced against a break request and an overall response timeout, so the
+        Stop-AI button takes effect immediately and a hung AI is force-stopped.
+        """
+        # Serialize processing so a second (concurrent) message cannot clear the
+        # break flag while this request is still running. Acquire off-loop so the
+        # event loop stays responsive while queued behind an in-flight request.
+        await asyncio.to_thread(self._message_lock.acquire)
+        try:
+            # Start each request from a clean break state so a stale Stop from a
+            # previous turn does not immediately cancel this one.
+            self._break_event.clear()
+            self._state.break_requested = False
+
+            self._state.human_message = message
+            self._state.messages.append({"role": "user", "content": message})
+
+            # Let the orchestrator interpret the interrupt, but do not let it
+            # block the loop: race it against a user break and a timeout.
+            interpret_task = asyncio.ensure_future(
+                self.orchestrator.interpret_interrupt(self._state, message)
+            )
+            break_task = asyncio.ensure_future(self._wait_for_break())
+
+            try:
+                done, _pending = await asyncio.wait(
+                    {interpret_task, break_task},
+                    timeout=self._response_timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                # Cancel whatever is still pending and await every task so its
+                # cancellation completes cleanly (avoids "Task was destroyed but
+                # it is pending" / unhandled-exception warnings).
+                for t in (interpret_task, break_task):
+                    if not t.done():
+                        t.cancel()
+                await asyncio.gather(interpret_task, break_task, return_exceptions=True)
+
+            if interpret_task not in done:
+                # Either the user stopped it, or it timed out. In both cases we
+                # stop waiting on the model. (The worker thread may still finish
+                # in the background, but its result is discarded.)
+                if self._break_event.is_set():
+                    self._broadcast("system", "🛑 AI processing stopped by user.")
+                else:
+                    self._broadcast(
+                        "system",
+                        f"⏱️ AI did not respond within {self._response_timeout:.0f}s - "
+                        "forcibly stopped.",
+                    )
+                return
+
+            try:
+                action = interpret_task.result()
+            except asyncio.CancelledError:
+                return
+            except Exception as e:  # pragma: no cover - defensive
+                self._broadcast("system", f"❌ Error interpreting message: {e}")
+                return
+
+            if action["action"] == "inject":
+                self._state.tasks.insert(0, {
+                    "id": f"human_{len(self._state.messages)}",
+                    "description": message,
+                    "status": "pending",
+                    "priority": action.get("priority", 5)
+                })
+            elif action["action"] == "abort":
+                self.request_break()
+        finally:
+            self._message_lock.release()
 
 
 # Factory function for easy instantiation
